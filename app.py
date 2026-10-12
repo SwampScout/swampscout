@@ -23,10 +23,10 @@ with st.sidebar:
     st.caption("Sentinel-2 pixels are typically 10 m for the main bands. Small openings can be missed.")
     st.divider()
     st.header("Habitat thresholds")
-    ndvi_min = st.slider("Vegetation NDVI minimum", 0.10, 0.75, 0.28, 0.01)
-    ndwi_max = st.slider("Wetness filter (NDWI maximum)", -0.60, 0.40, 0.05, 0.01,
+    ndvi_min = st.slider("Vegetation NDVI minimum", 0.05, 0.75, 0.15, 0.01)
+    ndwi_max = st.slider("Wetness filter (NDWI maximum)", -0.60, 0.50, 0.20, 0.01,
                          help="A broad filter: water/vegetation mixtures vary by season and location.")
-    min_patch_ha = st.slider("Minimum candidate patch", 0.2, 20.0, 1.0, 0.2)
+    min_patch_ha = st.slider("Minimum candidate patch", 0.1, 20.0, 0.2, 0.1)
     st.divider()
     show_public = st.checkbox("Show LDWF WMA/refuge boundaries", value=True)
     show_usace = st.checkbox("Show USACE WMA boundaries", value=True)
@@ -147,7 +147,7 @@ def add_geojson_layer(map_obj, geojson, name, color):
 
 st.divider()
 st.subheader("2. Scan recent satellite imagery")
-st.write("The scan searches recent Sentinel-2 Level-2A scenes over your box, filters cloudy scenes, then computes vegetation and wetness indices.")
+st.write("The scan searches recent Sentinel-2 Level-2A scenes over your box, filters cloudy scenes, then computes vegetation and wetness indices. Defaults are loosened to catch mixed water/vegetation marsh pixels; review the mask for false positives.")
 scan = st.button("Scan selected area", type="primary")
 
 if scan:
@@ -199,6 +199,8 @@ if scan:
             signed = planetary_computer.sign(item)
             # Read required COG bands, clipping to the selected geographic box.
             arrays = {}
+            scene_transform = None
+            scene_crs = None
             for band in ["B03", "B04", "B08"]:
                 asset = signed.assets.get(band)
                 if not asset:
@@ -210,9 +212,14 @@ if scan:
                     if win.width <= 0 or win.height <= 0:
                         arrays = {}
                         break
-                    data = ds.read(1, window=win, out_shape=(min(900, int(win.height)), min(900, int(win.width))),
+                    out_shape = (min(900, max(1, int(win.height))), min(900, max(1, int(win.width))))
+                    data = ds.read(1, window=win, out_shape=out_shape,
                                    resampling=Resampling.bilinear).astype(np.float32)
                     arrays[band] = data
+                    if band == "B03":
+                        from affine import Affine
+                        scene_transform = ds.window_transform(win) * Affine.scale(win.width / out_shape[1], win.height / out_shape[0])
+                        scene_crs = ds.crs
             if not arrays:
                 continue
             green, red, nir = arrays["B03"], arrays["B04"], arrays["B08"]
@@ -222,14 +229,23 @@ if scan:
             ndvi = np.divide(nir-red, denom_ndvi, out=np.zeros_like(nir), where=denom_ndvi != 0)
             denom_ndwi = green + nir
             ndwi = np.divide(green-nir, denom_ndwi, out=np.zeros_like(green), where=denom_ndwi != 0)
-            # Candidate class is vegetation that also has a broad wetness signal.
-            candidate = (ndvi >= float(ndvi_min)) & (ndwi <= float(ndwi_max)) & (nir > 0) & (green > 0)
-            # Very small speckles are filtered with connected components.
+            # Candidate vegetation mask. The user-adjustable NDWI threshold is a permissive
+            # screen, not proof of water. Keep lower NDVI mixed pixels so narrow marsh margins
+            # and partially water-covered vegetation have a chance to appear.
+            valid_reflectance = (nir > 0) & (green > 0) & (red >= 0)
+            candidate = (ndvi >= float(ndvi_min)) & (ndwi <= float(ndwi_max)) & valid_reflectance
+
+            # Exclude obvious open-water pixels: low vegetation signal plus a strongly
+            # positive green/NIR NDWI. This helps suppress false candidate markers on lakes.
+            open_water_like = (ndvi < max(float(ndvi_min) + 0.08, 0.23)) & (ndwi > 0.10)
+            candidate = candidate & (~open_water_like)
+
+            # Remove isolated noise but preserve narrow/irregular swamp-edge features.
             import cv2
             binary = candidate.astype(np.uint8)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
             nlab, labels, stats, cents = cv2.connectedComponentsWithStats(binary, 8)
-            pixel_area_m2 = 100  # approximate Sentinel-2 10 m pixels
+            pixel_area_m2 = 100  # approximate Sentinel-2 10 m pixels; area is a screening estimate
             min_pixels = max(1, int(float(min_patch_ha) * 10000 / pixel_area_m2))
             count_scene = 0
             for lab in range(1, nlab):
@@ -237,15 +253,19 @@ if scan:
                 if area < min_pixels:
                     continue
                 cx, cy = cents[lab]
-                lon = west + (cx / max(1, shape[1]-1)) * (east-west)
-                lat = north - (cy / max(1, shape[0]-1)) * (north-south)
+                # Convert the detected pixel center using the satellite raster's true transform,
+                # rather than linearly stretching the selected map box over the raster array.
+                px, py = scene_transform * (float(cx) + 0.5, float(cy) + 0.5)
+                from rasterio.warp import transform as warp_transform
+                lon_vals, lat_vals = warp_transform(scene_crs, "EPSG:4326", [px], [py])
+                lon, lat = lon_vals[0], lat_vals[0]
                 patch_rows.append({
                     "scene_date": item.datetime.date().isoformat() if item.datetime else "",
                     "scene_id": item.id,
                     "cloud_cover_pct": round(float(item.properties.get("eo:cloud_cover", 0)), 1),
                     "candidate_id": f"S{i+1}-P{count_scene+1}",
-                    "center_latitude_approx": round(lat, 6),
-                    "center_longitude_approx": round(lon, 6),
+                    "center_latitude": round(lat, 6),
+                    "center_longitude": round(lon, 6),
                     "estimated_patch_hectares": round(area * pixel_area_m2 / 10000, 2),
                     "pixel_width": int(ww), "pixel_height": int(hh),
                     "mean_ndvi": round(float(np.mean(ndvi[labels == lab])), 3),
@@ -303,7 +323,7 @@ if results:
 
 st.divider()
 st.subheader("3. Official public-land boundary overlay")
-st.write("The map below queries official LDWF WMA/refuge/conservation-area boundaries and, where available, USACE WMA boundaries for the selected box.")
+st.write("The map below queries official LDWF WMA/refuge/conservation-area boundaries and, where available, USACE WMA boundaries for the selected box. Candidate pins now use the raster's geographic transform; spectral false positives over open water can still occur.")
 try:
     west, south, east, north = st.session_state.bbox
     overlay_map = folium.Map(location=[(south+north)/2, (west+east)/2], zoom_start=11, tiles="OpenStreetMap")
@@ -332,7 +352,7 @@ try:
     if results:
         for _, row in pd.DataFrame(results["patches"]).iterrows():
             folium.CircleMarker(
-                [row["center_latitude_approx"], row["center_longitude_approx"]],
+                [row["center_latitude"], row["center_longitude"]],
                 radius=5, color="#e63946", fill=True, fill_opacity=0.85,
                 tooltip=f"{row['candidate_id']} · {row['estimated_patch_hectares']} ha · {row['scene_date']}"
             ).add_to(overlay_map)
